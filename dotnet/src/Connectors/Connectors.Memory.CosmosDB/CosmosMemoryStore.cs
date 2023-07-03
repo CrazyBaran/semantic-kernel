@@ -26,6 +26,8 @@ public sealed class CosmosMemoryStore : IMemoryStore
 {
     private Database _database;
     private string _databaseName;
+    private Container _container;
+    private string _containerName;
     private ILogger _log;
 
 #pragma warning disable CS8618 // Non-nullable field is uninitialized: Class instance is created and populated via factory method.
@@ -42,11 +44,12 @@ public sealed class CosmosMemoryStore : IMemoryStore
     /// <param name="log">Optional logger.</param>
     /// <param name="cancellationToken">The <see cref="CancellationToken"/> to monitor for cancellation requests. The default is <see cref="CancellationToken.None"/>.</param>
     /// <exception cref="CosmosException"></exception>
-    public static async Task<CosmosMemoryStore> CreateAsync(CosmosClient client, string databaseName, ILogger? log = null, CancellationToken cancellationToken = default)
+    public static async Task<CosmosMemoryStore> CreateAsync(CosmosClient client, string databaseName, string containerName, ILogger? log = null, CancellationToken cancellationToken = default)
     {
         var newStore = new CosmosMemoryStore();
 
         newStore._databaseName = databaseName;
+        newStore._containerName = containerName;
         newStore._log = log ?? NullLogger<CosmosMemoryStore>.Instance;
         var response = await client.CreateDatabaseIfNotExistsAsync(newStore._databaseName, cancellationToken: cancellationToken).ConfigureAwait(false);
 
@@ -65,6 +68,23 @@ public sealed class CosmosMemoryStore : IMemoryStore
 
         newStore._database = response.Database;
 
+        var containerResponse = await newStore._database.CreateContainerIfNotExistsAsync(containerName, "/collectionId", cancellationToken: cancellationToken).ConfigureAwait(false);
+
+        if (containerResponse.StatusCode == HttpStatusCode.Created)
+        {
+            newStore._log.LogInformation("Created collection {0}", containerName);
+        }
+        else if (containerResponse.StatusCode == HttpStatusCode.OK)
+        {
+            newStore._log.LogInformation("Collection {0} already exists", containerName);
+        }
+        else
+        {
+            throw new CosmosException("Collection does not exist and was not created", response.StatusCode, 0, containerName, 0);
+        }
+
+        newStore._container = containerResponse.Container;
+        
         return newStore;
     }
 
@@ -73,27 +93,14 @@ public sealed class CosmosMemoryStore : IMemoryStore
     {
         // Azure Cosmos DB does not support listing all Containers, this does not break the interface but it is not ideal.
         this._log.LogWarning("Listing all containers is not supported by Azure Cosmos DB, returning empty list.");
-
+        
         return Enumerable.Empty<string>().ToAsyncEnumerable();
     }
 
     /// <inheritdoc />
     public async Task CreateCollectionAsync(string collectionName, CancellationToken cancellationToken = default)
     {
-        var response = await this._database.CreateContainerIfNotExistsAsync(collectionName, "/" + collectionName, cancellationToken: cancellationToken).ConfigureAwait(false);
-
-        if (response.StatusCode == HttpStatusCode.Created)
-        {
-            this._log.LogInformation("Created collection {0}", collectionName);
-        }
-        else if (response.StatusCode == HttpStatusCode.OK)
-        {
-            this._log.LogInformation("Collection {0} already exists", collectionName);
-        }
-        else
-        {
-            throw new CosmosException("Collection does not exist and was not created", response.StatusCode, 0, collectionName, 0);
-        }
+        // Collection is created by populating Record.
     }
 
     /// <inheritdoc />
@@ -107,14 +114,9 @@ public sealed class CosmosMemoryStore : IMemoryStore
     /// <inheritdoc />
     public async Task DeleteCollectionAsync(string collectionName, CancellationToken cancellationToken = default)
     {
-        var container = this._database.Client.GetContainer(this._databaseName, collectionName);
-        try
+        await foreach (var record in this.GetAllAsync(collectionName, cancellationToken))
         {
-            await container.DeleteContainerAsync(cancellationToken: cancellationToken).ConfigureAwait(false);
-        }
-        catch (CosmosException ex)
-        {
-            this._log.LogError(ex, "Failed to delete collection {0}: {2} - {3}", collectionName, ex.StatusCode, ex.Message);
+            await this.RemoveAsync(collectionName, record.Key, cancellationToken).ConfigureAwait(false);
         }
     }
 
@@ -122,12 +124,11 @@ public sealed class CosmosMemoryStore : IMemoryStore
     public async Task<MemoryRecord?> GetAsync(string collectionName, string key, bool withEmbedding = false, CancellationToken cancellationToken = default)
     {
         var id = this.ToCosmosFriendlyId(key);
-        var partitionKey = PartitionKey.None;
-
-        var container = this._database.Client.GetContainer(this._databaseName, collectionName);
+        var partitionKey = new PartitionKey(this.ToCosmosFriendlyId(collectionName));
+        
         MemoryRecord? memoryRecord = null;
 
-        var response = await container.ReadItemAsync<CosmosMemoryRecord>(id, partitionKey, cancellationToken: cancellationToken).ConfigureAwait(false);
+        var response = await this._container.ReadItemAsync<CosmosMemoryRecord>(id, partitionKey, cancellationToken: cancellationToken).ConfigureAwait(false);
 
         if (response == null)
         {
@@ -185,9 +186,7 @@ public sealed class CosmosMemoryStore : IMemoryStore
             MetadataString = record.GetSerializedMetadata()
         };
 
-        var container = this._database.Client.GetContainer(this._databaseName, collectionName);
-
-        var response = await container.UpsertItemAsync(entity, cancellationToken: cancellationToken).ConfigureAwait(false);
+        var response = await this._container.UpsertItemAsync(entity, cancellationToken: cancellationToken).ConfigureAwait(false);
 
         if (response.StatusCode is HttpStatusCode.OK or HttpStatusCode.Created)
         {
@@ -213,10 +212,9 @@ public sealed class CosmosMemoryStore : IMemoryStore
     /// <inheritdoc />
     public async Task RemoveAsync(string collectionName, string key, CancellationToken cancellationToken = default)
     {
-        var container = this._database.Client.GetContainer(this._databaseName, collectionName);
-        var response = await container.DeleteItemAsync<CosmosMemoryRecord>(
-            key,
-            PartitionKey.None,
+        var response = await this._container.DeleteItemAsync<CosmosMemoryRecord>(
+            this.ToCosmosFriendlyId(key),
+            new PartitionKey(this.ToCosmosFriendlyId(collectionName)),
             cancellationToken: cancellationToken).ConfigureAwait(false);
 
         if (response.StatusCode == HttpStatusCode.OK)
@@ -292,10 +290,10 @@ public sealed class CosmosMemoryStore : IMemoryStore
 
     private async IAsyncEnumerable<MemoryRecord> GetAllAsync(string collectionName, [EnumeratorCancellation] CancellationToken cancellationToken = default)
     {
-        var container = this._database.Client.GetContainer(this._databaseName, collectionName);
-        var query = new QueryDefinition("SELECT * FROM c");
-
-        var iterator = container.GetItemQueryIterator<CosmosMemoryRecord>(query);
+        var query = new QueryDefinition("SELECT * FROM c WHERE c.CollectionId = @collectionId")
+            .WithParameter("@collectionId", this.ToCosmosFriendlyId(collectionName));
+    
+        var iterator = this._container.GetItemQueryIterator<CosmosMemoryRecord>(query);
 
         while (iterator.HasMoreResults) //read all result in batch
         {

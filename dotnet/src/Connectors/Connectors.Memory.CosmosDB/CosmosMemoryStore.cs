@@ -290,7 +290,7 @@ public sealed class CosmosMemoryStore : IMemoryStore
 
     private async IAsyncEnumerable<MemoryRecord> GetAllAsync(string collectionName, [EnumeratorCancellation] CancellationToken cancellationToken = default)
     {
-        var query = new QueryDefinition("SELECT * FROM c WHERE c.CollectionId = @collectionId")
+        var query = new QueryDefinition("SELECT * FROM c WHERE c.collectionId = @collectionId")
             .WithParameter("@collectionId", this.ToCosmosFriendlyId(collectionName));
     
         var iterator = this._container.GetItemQueryIterator<CosmosMemoryRecord>(query);

@@ -72,15 +72,15 @@ public sealed class CosmosMemoryStore : IMemoryStore
 
         if (containerResponse.StatusCode == HttpStatusCode.Created)
         {
-            newStore._log.LogInformation("Created collection {0}", containerName);
+            newStore._log.LogInformation("Created Container {0}", containerName);
         }
         else if (containerResponse.StatusCode == HttpStatusCode.OK)
         {
-            newStore._log.LogInformation("Collection {0} already exists", containerName);
+            newStore._log.LogInformation("Container {0} already exists", containerName);
         }
         else
         {
-            throw new CosmosException("Collection does not exist and was not created", response.StatusCode, 0, containerName, 0);
+            throw new CosmosException("Container does not exist and was not created", response.StatusCode, 0, containerName, 0);
         }
 
         newStore._container = containerResponse.Container;
